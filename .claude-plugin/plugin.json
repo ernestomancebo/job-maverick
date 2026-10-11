@@ -1,0 +1,11 @@
+{
+  "name": "job-maverick",
+  "displayName": "Job Maverick",
+  "description": "Career coach for accomplished professionals who have never had to sell themselves: verified brag document, master resume, 2-page tailored resumes per posting, compensation bands, pipeline tracker and gap matrix, LinkedIn text. Coaches; never submits.",
+  "version": "0.1.0",
+  "author": { "name": "Ernesto Mancebo", "url": "https://github.com/ernestomancebo" },
+  "homepage": "https://github.com/ernestomancebo/job-maverick",
+  "repository": "https://github.com/ernestomancebo/job-maverick",
+  "license": "MIT",
+  "keywords": ["job-search", "resume", "career", "ats", "linkedin", "negotiation", "coach"]
+}

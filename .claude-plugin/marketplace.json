@@ -1,0 +1,15 @@
+{
+  "name": "ernestomancebo",
+  "owner": {
+    "name": "Ernesto Mancebo",
+    "url": "https://github.com/ernestomancebo"
+  },
+  "plugins": [
+    {
+      "name": "job-maverick",
+      "source": "./",
+      "description": "Career coach for champions who don't know how to sell their medals."
+    }
+  ],
+  "description": "Ernesto Mancebo's Claude Code plugins. Currently: job-maverick, a career coach for champions who don't know how to sell their medals."
+}
