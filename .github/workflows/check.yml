@@ -1,0 +1,35 @@
+name: check
+on: [push, pull_request]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Compile scripts
+        run: python3 -m py_compile skills/job-maverick/scripts/*.py
+      - name: Shell syntax
+        run: bash -n skills/job-maverick/scripts/build-resume.sh
+      - name: Pipeline smoke test (in a scratch project)
+        run: |
+          mkdir -p /tmp/proj && cd /tmp/proj
+          python3 "$GITHUB_WORKSPACE/skills/job-maverick/scripts/pipeline.py" init
+          python3 "$GITHUB_WORKSPACE/skills/job-maverick/scripts/pipeline.py" add company="Acme" role="Charge Nurse" url=https://example.com lane=A tier=1 eligible=yes comp="80-95K" gaps=example-gap
+          python3 "$GITHUB_WORKSPACE/skills/job-maverick/scripts/pipeline.py" set 01 status=applied applied=2026-01-31 tier=2
+          python3 "$GITHUB_WORKSPACE/skills/job-maverick/scripts/pipeline.py" list applied | grep Acme
+          grep -q "example-gap" gaps.md
+      - name: Scanner config smoke test
+        run: |
+          cd /tmp/proj
+          python3 "$GITHUB_WORKSPACE/skills/job-maverick/scripts/jobs-scan.py" init
+          test -f boards.json
+      - name: Frontmatter sanity
+        run: |
+          head -1 skills/job-maverick/SKILL.md | grep -q '^---$'
+          grep -q '^name: job-maverick$' skills/job-maverick/SKILL.md
+          grep -q '^description: ' skills/job-maverick/SKILL.md
+      - name: No personal data in the skill
+        run: |
+          ! grep -rniE 'ernesto|peggy|mancebo' skills/ --include='*.md' --include='*.py' --include='*.sh' --include='*.json'

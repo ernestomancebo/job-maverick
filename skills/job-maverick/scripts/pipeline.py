@@ -1,131 +1,175 @@
 #!/usr/bin/env python3
 """Job pipeline: pipeline.json is canonical; this renders PIPELINE.md and gaps.md.
 
+Runs in the directory you call it from (the person's project), never inside the plugin.
+
 Usage:
-  python3 pipeline.py render                       # rewrite PIPELINE.md and gaps.md
-  python3 pipeline.py set <id> status=applied applied=2026-10-12 next="follow up 2026-10-19"
-  python3 pipeline.py add company="X" role="Y" url=... lane=A tier=1 bc=yes comp="..." gaps=go,gcp
+  python3 pipeline.py init                       # create pipeline.json (empty) and an example gaps.json
+  python3 pipeline.py render                     # rewrite PIPELINE.md and gaps.md
+  python3 pipeline.py add company="X" role="Y" url=... lane=A tier=1 eligible=yes comp="..." gaps=a,b
+  python3 pipeline.py set <id> status=applied applied=2026-01-31 next="follow up 2026-02-07"
   python3 pipeline.py list [status]
+
 Statuses: found, triaged, tailoring, drafted, applied, replied, interview, offer, rejected, closed, parked
+Tiers: 1 (apply first), 2 (next), 3 (keep warm)
+gaps.json maps each gap name to one prep action; unknown gaps render as TODO.
 """
-import json, sys, re
+import json
+import sys
+from dataclasses import dataclass, field, asdict
 from datetime import date
 from pathlib import Path
+from typing import List
 
-HERE = Path.cwd()  # pipeline.json, PIPELINE.md and gaps.md live in the project you run this from
-DB = HERE / "pipeline.json"
+PROJECT = Path.cwd()
+DB = PROJECT / "pipeline.json"
+GAPS_DB = PROJECT / "gaps.json"
+TRACKER = PROJECT / "PIPELINE.md"
+MATRIX = PROJECT / "gaps.md"
 
-# Each recurring gap maps to one concrete prep action (the coaching plan).
-# EXAMPLE entries below; replace with the person's gaps. Unknown gaps render as TODO.
-GAP_ACTIONS = {
-    "k8s-cluster-ops": "Weekend EKS lab: cluster + node-pool upgrade, requests/limits right-sizing, Kyverno policy. Write it up (Medium post).",
-    "go": "Finish whatomate PR #51 (self-hosted models) and ship one small Go CLI; link both on the resume.",
-    "gcp": "GCP fundamentals lab: GKE, IAM, Cloud Build; map every AWS skill to its GCP name on the resume.",
-    "pulumi": "Port one Terraform module to Pulumi (Python) in a public repo.",
-    "rails": "Read Jane's public engineering posts; do a 2-hour Rails security review exercise (strong params, CSRF, Brakeman).",
-    "ruby": "Same as rails: enough Ruby to review a PR.",
-    "scala-java": "Refresh Java (you have 2013–2018): one Spring Boot service with tests; mention in interviews, not on the resume.",
-    "ebpf": "Read Tigera/Calico eBPF docs; run one bpftrace example. Interview talking point only.",
-    "k8s-networking": "NetworkPolicy + Gateway API lab on the same EKS cluster as k8s-cluster-ops.",
-    "argocd": "Deploy the EKS lab app with ArgoCD (GitOps); 2 hours.",
-    "detection-response": "Not your core; only pursue if the role is otherwise ideal. Prep: GuardDuty/SIEM story as detection engineering.",
-    "incident-response": "Prep the GuardDuty incident as an IR narrative (timeline, containment, lessons).",
-    "offensive-security": "Skip unless the role is reframed; your profile is defensive/AppSec.",
-    "amazon-loop-prep": "Write 8 Leadership Principle stories from the STAR set; practice bar-raiser style questions.",
-    "enterprise-hr-domain": "Map FinTech data-governance work to HR/finance data constraints; no prep beyond talking points.",
-    "salary-below-floor": "Decide before applying: exception only with equity and a path to the floor within 12 months.",
-    "location-eligibility": "Confirm Canada/BC eligibility with the recruiter before tailoring.",
-    "strategy-role": "Not a builder role; keep warm as a fallback, don't tailor.",
-    "program-level": "Same as strategy-role.",
-    "gtm-domain": "GTM automation agents; weak fit, keep warm.",
-    "us-hq-remote": "Remote for a US HQ: pays well, does not qualify for BC PNP. Fine as a backup.",
+STATUSES = ["offer", "interview", "replied", "applied", "drafted", "tailoring", "triaged", "found",
+            "parked", "rejected", "closed"]
+ACTIVE = {"found", "triaged", "tailoring", "drafted", "applied", "replied", "interview", "offer"}
+TIER_WEIGHT = {1: 3, 2: 2, 3: 1}
+
+EXAMPLE_GAPS = {
+    "example-gap": "Replace with the person's gaps: one concrete prep action per gap, e.g. 'Weekend lab on X; write it up.'",
 }
 
-ACTIVE = {"found", "triaged", "tailoring", "drafted", "applied", "replied", "interview", "offer"}
+
+@dataclass
+class Role:
+    id: str
+    company: str
+    role: str
+    url: str = ""
+    lane: str = ""
+    tier: int = 3
+    eligible: str = ""      # local eligibility note (immigration program, licence, on-site), free text
+    comp: str = ""          # posted range, with currency
+    status: str = "found"
+    applied: str = ""
+    next: str = ""
+    gaps: List[str] = field(default_factory=list)
+    notes: str = ""
+    resume: str = ""        # path to the tailored resume folder
+
+    @classmethod
+    def from_dict(cls, d):
+        known = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
+        known["tier"] = int(known.get("tier", 3))
+        known["gaps"] = list(known.get("gaps") or [])
+        return cls(**known)
 
 
-def load():
-    return json.loads(DB.read_text()) if DB.exists() else []
+def load_roles():
+    if not DB.exists():
+        sys.exit("no pipeline.json here; run `pipeline.py init` in your project directory first")
+    return [Role.from_dict(d) for d in json.loads(DB.read_text())]
 
 
-def save(rows):
-    DB.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n")
+def save_roles(roles):
+    DB.write_text(json.dumps([asdict(r) for r in roles], indent=2, ensure_ascii=False) + "\n")
 
 
-def render(rows):
-    order = {"interview": 0, "replied": 1, "applied": 2, "drafted": 3, "tailoring": 4, "triaged": 5, "found": 6,
-             "offer": -1, "parked": 7, "rejected": 8, "closed": 9}
-    rows_sorted = sorted(rows, key=lambda r: (order.get(r["status"], 9), r.get("tier", 9), r["company"]))
+def load_gap_actions():
+    return json.loads(GAPS_DB.read_text()) if GAPS_DB.exists() else {}
+
+
+def render(roles):
+    actions = load_gap_actions()
+    order = {s: i for i, s in enumerate(STATUSES)}
+    rows = sorted(roles, key=lambda r: (order.get(r.status, 99), r.tier, r.company))
     out = [f"# Job pipeline — rendered {date.today()} from pipeline.json (canonical; edit with pipeline.py)\n",
-           "| ID | Company | Role | Lane | Tier | BC | Comp (CAD) | Status | Applied | Next action | Gaps |",
+           "| ID | Company | Role | Lane | Tier | Eligible | Comp | Status | Applied | Next action | Gaps |",
            "|---|---|---|---|---|---|---|---|---|---|---|"]
-    for r in rows_sorted:
-        out.append(f"| {r['id']} | {r['company']} | [{r['role']}]({r['url']}) | {r['lane']} | {r.get('tier','')} | {r.get('bc','')} | {r.get('comp','')} | **{r['status']}** | {r.get('applied','')} | {r.get('next','')} | {', '.join(r.get('gaps', []))} |")
+    for r in rows:
+        link = f"[{r.role}]({r.url})" if r.url else r.role
+        out.append(f"| {r.id} | {r.company} | {link} | {r.lane} | {r.tier} | {r.eligible} | {r.comp} | "
+                   f"**{r.status}** | {r.applied} | {r.next} | {', '.join(r.gaps)} |")
     counts = {}
-    for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    out.append("\nStatus counts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
-    (HERE / "PIPELINE.md").write_text("\n".join(out) + "\n")
+    for r in roles:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    out.append("\nStatus counts: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"))
+    TRACKER.write_text("\n".join(out) + "\n")
 
-    # Gap matrix over active roles, weighted by tier (tier 1 counts 3, tier 2 counts 2, tier 3 counts 1)
-    weight = {1: 3, 2: 2, 3: 1}
     gaps = {}
-    for r in rows:
-        if r["status"] not in ACTIVE:
+    for r in roles:
+        if r.status not in ACTIVE:
             continue
-        for g in r.get("gaps", []):
-            gaps.setdefault(g, {"roles": [], "score": 0})
-            gaps[g]["roles"].append(f"{r['company']} (T{r.get('tier','?')})")
-            gaps[g]["score"] += weight.get(r.get("tier"), 1)
+        for g in r.gaps:
+            entry = gaps.setdefault(g, {"roles": [], "score": 0})
+            entry["roles"].append(f"{r.company} (T{r.tier})")
+            entry["score"] += TIER_WEIGHT.get(r.tier, 1)
+    ranked = sorted(gaps.items(), key=lambda kv: -kv[1]["score"])
     out = [f"# Gap matrix — rendered {date.today()}\n",
-           "Which must-haves you miss, how often they block the roles you want (weighted by tier), and the one prep action per gap.\n",
+           "Which must-haves you miss, how often they block the roles you want (weighted by tier), "
+           "and the one prep action per gap (from gaps.json).\n",
            "| Gap | Score | Roles blocked | Prep action |", "|---|---|---|---|"]
-    for g, v in sorted(gaps.items(), key=lambda kv: -kv[1]["score"]):
-        out.append(f"| {g} | {v['score']} | {', '.join(v['roles'])} | {GAP_ACTIONS.get(g, 'TODO')} |")
-    top = [g for g, _ in sorted(gaps.items(), key=lambda kv: -kv[1]["score"])[:3]]
+    for g, v in ranked:
+        out.append(f"| {g} | {v['score']} | {', '.join(v['roles'])} | {actions.get(g, 'TODO: add to gaps.json')} |")
     out.append("\n## This week's prep, by score\n")
-    for i, g in enumerate(top, 1):
-        out.append(f"{i}. **{g}** — {GAP_ACTIONS.get(g, 'TODO')}")
-    (HERE / "gaps.md").write_text("\n".join(out) + "\n")
+    for i, (g, _) in enumerate(ranked[:3], 1):
+        out.append(f"{i}. **{g}** — {actions.get(g, 'TODO: add to gaps.json')}")
+    MATRIX.write_text("\n".join(out) + "\n")
 
 
 def parse_kv(args):
     kv = {}
     for a in args:
         k, _, v = a.partition("=")
-        kv[k] = v.split(",") if k == "gaps" else v
+        if k == "gaps":
+            kv[k] = [x for x in v.split(",") if x]
+        elif k == "tier":
+            kv[k] = int(v)
+        else:
+            kv[k] = v
     return kv
 
 
-def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "render"
-    rows = load()
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "render"
+    if cmd == "init":
+        if not DB.exists():
+            DB.write_text("[]\n")
+        if not GAPS_DB.exists():
+            GAPS_DB.write_text(json.dumps(EXAMPLE_GAPS, indent=2) + "\n")
+        render(load_roles())
+        print(f"initialized {DB.name}, {GAPS_DB.name}, {TRACKER.name}, {MATRIX.name} in {PROJECT}")
+        return
+    roles = load_roles()
     if cmd == "render":
-        render(rows)
+        render(roles)
     elif cmd == "list":
-        want = sys.argv[2] if len(sys.argv) > 2 else None
-        for r in rows:
-            if not want or r["status"] == want:
-                print(f"{r['id']:<4} {r['status']:<9} T{r.get('tier','?')} {r['company']} — {r['role']}")
+        want = argv[2] if len(argv) > 2 else None
+        for r in roles:
+            if not want or r.status == want:
+                print(f"{r.id:<4} {r.status:<9} T{r.tier} {r.company} — {r.role}")
     elif cmd == "set":
-        rid = sys.argv[2]
-        kv = parse_kv(sys.argv[3:])
-        for r in rows:
-            if r["id"] == rid:
-                r.update(kv)
+        rid = argv[2]
+        kv = parse_kv(argv[3:])
+        for r in roles:
+            if r.id == rid:
+                for k, v in kv.items():
+                    if k not in Role.__dataclass_fields__:
+                        sys.exit(f"unknown field {k}")
+                    setattr(r, k, v)
                 break
         else:
             sys.exit(f"no row with id {rid}")
-        save(rows); render(rows)
+        if kv.get("status") not in (None, *STATUSES):
+            sys.exit(f"unknown status; use one of {', '.join(STATUSES)}")
+        save_roles(roles)
+        render(roles)
     elif cmd == "add":
-        kv = parse_kv(sys.argv[2:])
-        kv.setdefault("status", "found"); kv.setdefault("gaps", [])
-        kv["tier"] = int(kv.get("tier", 3))
-        kv["id"] = f"{len(rows)+1:02d}"
-        rows.append(kv); save(rows); render(rows)
+        kv = parse_kv(argv[2:])
+        kv["id"] = f"{len(roles) + 1:02d}"
+        roles.append(Role.from_dict(kv))
+        save_roles(roles)
+        render(roles)
     else:
         sys.exit(__doc__)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv)
